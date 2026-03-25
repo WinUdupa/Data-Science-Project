@@ -6,6 +6,7 @@ from typing import Collection, Sequence, Type
 import numpy as np
 import time
 import re
+import sys
 
 from llmfe import evaluator
 from llmfe import buffer
@@ -16,6 +17,9 @@ import http.client
 import os
 
 from dotenv import load_dotenv
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from prompt_evolution import PromptEvolver
+
 load_dotenv()
 
 
@@ -57,20 +61,18 @@ class Sampler:
         self.config = config
         self.__class__._global_samples_nums = 1
 
-    
     def sample(self, **kwargs):
         """ Continuously gets prompts, samples programs, sends them for analysis. """
         while True:
             # stop the search process if hit global max sample nums
             if self._max_sample_nums//5 and self.__class__._global_samples_nums >= self._max_sample_nums//5:
                 break
-            
+
             prompt = self._database.get_prompt()
             reset_time = time.time()
             samples = self._llm.draw_samples(prompt.code, self.config)
             sample_time = (time.time() - reset_time) / self._samples_per_prompt
 
-            # This loop can be executed in parallel on remote evaluator machines.
             for sample in samples:
                 sample = "\n    import pandas as pd\n    import numpy as np\n" + sample
                 self._global_sample_nums_plus_one()
@@ -100,44 +102,25 @@ class Sampler:
 
 def _extract_body(sample: str, config: config_lib.Config) -> str:
     """
-    Extract the function body from a response sample, removing any preceding descriptions
-    and the function signature. Preserves indentation.
-    ------------------------------------------------------------------------------------------------------------------
-    Input example:
-    ```
-    This is a description...
-    def function_name(...):
-        return ...
-    Additional comments...
-    ```
-    ------------------------------------------------------------------------------------------------------------------
-    Output example:
-    ```
-        return ...
-    Additional comments...
-    ```
-    ------------------------------------------------------------------------------------------------------------------
+    Extract the function body from a response sample, removing any preceding
+    descriptions and the function signature. Preserves indentation.
     If no function definition is found, returns the original sample.
     """
     lines = sample.splitlines()
     func_body_lineno = 0
     find_def_declaration = False
-    
+
     for lineno, line in enumerate(lines):
-        # find the first 'def' program statement in the response
         if line[:3] == 'def':
             func_body_lineno = lineno
             find_def_declaration = True
             break
-    
+
     if find_def_declaration:
-        # for gpt APIs
         if config.use_api:
             code = ''
             for line in lines[func_body_lineno + 1:]:
                 code += line + '\n'
-        
-        # for mixtral
         else:
             code = ''
             indent = '    '
@@ -145,45 +128,48 @@ def _extract_body(sample: str, config: config_lib.Config) -> str:
                 if line[:4] != indent:
                     line = indent + line
                 code += line + '\n'
-        
         return code
-    
+
     return sample
 
 
 
 class LocalLLM(LLM):
     def __init__(self, samples_per_prompt: int, batch_inference: bool = True, trim=True) -> None:
-        """
-        Args:
-            batch_inference: Use batch inference when sample equation program skeletons. The batch size equals to the samples_per_prompt.
-        """
         super().__init__(samples_per_prompt)
 
-        url = "http://127.0.0.1:5000/completions"
-        instruction_prompt = ("You are a helpful assistant tasked with discovering new features/ dropping less important feaures for the given prediction task. \
-                             Complete the 'modify_features' function below, considering the physical meaning and relationships of inputs.\n\n")
         self._batch_inference = batch_inference
-        self._url = url
-        self._instruction_prompt = instruction_prompt
+        self._url  = "http://127.0.0.1:5000/completions"
         self._trim = trim
+
+        # ── Prompt Evolver ──────────────────────────────────────
+        # Control via environment variables so no code changes needed:
+        #   EVOLVE_MODEL    — which model to use for meta-prompting
+        #   EVOLVE_INTERVAL — how many iterations between evolutions
+        #   LOG_PATH        — where to save the prompt evolution log
+        self.evolver = PromptEvolver(
+            api_model          = os.environ.get("EVOLVE_MODEL", "llama-3.3-70b-versatile"),
+            evolution_interval = int(os.environ.get("EVOLVE_INTERVAL", "5")),
+            top_k              = 3,
+            bad_k              = 2,
+            log_path           = os.environ.get("LOG_PATH", "./logs/prompt_evolution"),
+        )
+
+        self._instruction_prompt = self.evolver.get_prompt()
 
 
     def draw_samples(self, prompt: str, config: config_lib.Config) -> Collection[str]:
-        """Returns multiple equation program skeleton hypotheses for the given `prompt`."""
         if config.use_api:
             return self._draw_samples_api(prompt, config)
         else:
             return self._draw_samples_local(prompt, config)
 
 
-    def _draw_samples_local(self, prompt: str, config: config_lib.Config) -> Collection[str]:    
-        # instruction
+    def _draw_samples_local(self, prompt: str, config: config_lib.Config) -> Collection[str]:
         prompt = '\n'.join([self._instruction_prompt, prompt])
         while True:
             try:
                 all_samples = []
-                # response from llm server
                 if self._batch_inference:
                     response = self._do_request(prompt)
                     for res in response:
@@ -193,10 +179,9 @@ class LocalLLM(LLM):
                         response = self._do_request(prompt)
                         all_samples.append(response)
 
-                # trim equation program skeleton body from samples
                 if self._trim:
                     all_samples = [_extract_body(sample, config) for sample in all_samples]
-                
+
                 return all_samples
             except Exception:
                 continue
@@ -204,62 +189,62 @@ class LocalLLM(LLM):
 
     def _draw_samples_api(self, prompt: str, config: config_lib.Config) -> Collection[str]:
         all_samples = []
-        prompt = '\n'.join([self._instruction_prompt, prompt])
 
-        # Verify API key is available before starting
+        # ── Evolve instruction prompt if interval reached ────────
+        self._instruction_prompt = self.evolver.maybe_evolve()
+        full_prompt = '\n'.join([self._instruction_prompt, prompt])
+
+        # ── Verify API key ───────────────────────────────────────
         api_key = os.environ.get('API_KEY')
         if not api_key:
-            raise ValueError("API_KEY environment variable is not set! Add it to your .env file.")
-        
+            raise ValueError("API_KEY not set. Add it to your .env file.")
+
+        # ── Auto-detect endpoint ─────────────────────────────────
+        if "gpt" in config.api_model.lower():
+            host, endpoint = "api.openai.com", "/v1/chat/completions"
+        else:
+            host, endpoint = "api.groq.com", "/openai/v1/chat/completions"
+
         for _ in range(self._samples_per_prompt):
             max_retries = 10
             for attempt in range(max_retries):
                 try:
-                    conn = http.client.HTTPSConnection("api.groq.com")
+                    conn    = http.client.HTTPSConnection(host)
                     payload = json.dumps({
                         "max_tokens": 512,
-                        "model": config.api_model,
-                        "messages": [
-                            {
-                                "role": "user",
-                                "content": prompt
-                            }
-                        ]
+                        "model":      config.api_model,
+                        "messages":   [{"role": "user", "content": full_prompt}]
                     })
                     headers = {
                         'Authorization': f"Bearer {api_key}",
-                        'User-Agent': 'Apifox/1.0.0 (https://apifox.com)',
-                        'Content-Type': 'application/json'
+                        'User-Agent':    'Apifox/1.0.0 (https://apifox.com)',
+                        'Content-Type':  'application/json'
                     }
-                    conn.request("POST", "/openai/v1/chat/completions", payload, headers)
-                    res = conn.getresponse()
+                    conn.request("POST", endpoint, payload, headers)
+                    res  = conn.getresponse()
                     data = json.loads(res.read().decode("utf-8"))
 
-                    # Check for API-level errors
                     if 'error' in data:
                         error = data['error']
                         print(f"API error: {error}")
-
-                        # Handle rate limit — extract exact wait time from error message
                         if error.get('code') == 'rate_limit_exceeded':
                             message = error.get('message', '')
-                            match = re.search(r'try again in ([0-9.]+)s', message)
-                            if match:
-                                wait_time = float(match.group(1)) + 1  # add 1s buffer
-                            else:
-                                wait_time = 60  # default wait 60s if time not found
-                            print(f"Rate limited. Waiting {wait_time:.1f} seconds before retrying...")
-                            time.sleep(wait_time)
+                            match   = re.search(r'try again in ([0-9.]+)s', message)
+                            wait    = float(match.group(1)) + 1 if match else 60
+                            print(f"Rate limited. Waiting {wait:.1f}s...")
+                            time.sleep(wait)
                         else:
-                            # For other errors (invalid key, model not found, etc.)
                             time.sleep(2)
                         continue
 
                     response = data['choices'][0]['message']['content']
-                    
+
                     if self._trim:
                         response = _extract_body(response, config)
-                    
+
+                    # Record in evolver (score unknown here, updated later)
+                    self.evolver.record(score=None, feature_fn=response)
+
                     all_samples.append(response)
                     break
 
@@ -268,16 +253,24 @@ class LocalLLM(LLM):
                     time.sleep(2)
             else:
                 print("Max retries reached. Skipping this sample.")
-                all_samples.append("")  # append empty so the loop doesn't hang
-        
+                all_samples.append("")
+
         return all_samples
-    
-    
+
+    def update_last_score(self, score: float):
+        """
+        Hook this into the evaluator to give accurate scores to the evolver.
+        Call after each feature is evaluated:
+            llm.update_last_score(score=0.834)
+        """
+        if self.evolver._records:
+            self.evolver._records[-1].score = score
+
+
     def _do_request(self, content: str) -> str:
         content = content.strip('\n').strip()
-        # repeat the prompt for batch inference
         repeat_prompt: int = self._samples_per_prompt if self._batch_inference else 1
-        
+
         data = {
             'prompt': content,
             'repeat_prompt': repeat_prompt,
@@ -290,11 +283,10 @@ class LocalLLM(LLM):
                 'skip_special_tokens': True,
             }
         }
-        
-        headers = {'Content-Type': 'application/json'}
+
+        headers  = {'Content-Type': 'application/json'}
         response = requests.post(self._url, data=json.dumps(data), headers=headers)
-        
-        if response.status_code == 200: #Server status code 200 indicates successful HTTP request! 
+
+        if response.status_code == 200:
             response = response.json()["content"]
-            
             return response if self._batch_inference else response[0]
