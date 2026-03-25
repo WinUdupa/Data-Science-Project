@@ -5,6 +5,7 @@ from abc import ABC, abstractmethod
 from typing import Collection, Sequence, Type
 import numpy as np
 import time
+import re
 
 from llmfe import evaluator
 from llmfe import buffer
@@ -14,6 +15,8 @@ import json
 import http.client
 import os
 
+from dotenv import load_dotenv
+load_dotenv()
 
 
 class LLM(ABC):
@@ -64,7 +67,7 @@ class Sampler:
             
             prompt = self._database.get_prompt()
             reset_time = time.time()
-            samples = self._llm.draw_samples(prompt.code,self.config)
+            samples = self._llm.draw_samples(prompt.code, self.config)
             sample_time = (time.time() - reset_time) / self._samples_per_prompt
 
             # This loop can be executed in parallel on remote evaluator machines.
@@ -202,11 +205,17 @@ class LocalLLM(LLM):
     def _draw_samples_api(self, prompt: str, config: config_lib.Config) -> Collection[str]:
         all_samples = []
         prompt = '\n'.join([self._instruction_prompt, prompt])
+
+        # Verify API key is available before starting
+        api_key = os.environ.get('API_KEY')
+        if not api_key:
+            raise ValueError("API_KEY environment variable is not set! Add it to your .env file.")
         
         for _ in range(self._samples_per_prompt):
-            while True:
+            max_retries = 10
+            for attempt in range(max_retries):
                 try:
-                    conn = http.client.HTTPSConnection("api.openai.com")
+                    conn = http.client.HTTPSConnection("api.groq.com")
                     payload = json.dumps({
                         "max_tokens": 512,
                         "model": config.api_model,
@@ -218,13 +227,34 @@ class LocalLLM(LLM):
                         ]
                     })
                     headers = {
-                        'Authorization': f"Bearer {os.environ['API_KEY']}",
+                        'Authorization': f"Bearer {api_key}",
                         'User-Agent': 'Apifox/1.0.0 (https://apifox.com)',
                         'Content-Type': 'application/json'
                     }
-                    conn.request("POST", "/v1/chat/completions", payload, headers)
+                    conn.request("POST", "/openai/v1/chat/completions", payload, headers)
                     res = conn.getresponse()
                     data = json.loads(res.read().decode("utf-8"))
+
+                    # Check for API-level errors
+                    if 'error' in data:
+                        error = data['error']
+                        print(f"API error: {error}")
+
+                        # Handle rate limit — extract exact wait time from error message
+                        if error.get('code') == 'rate_limit_exceeded':
+                            message = error.get('message', '')
+                            match = re.search(r'try again in ([0-9.]+)s', message)
+                            if match:
+                                wait_time = float(match.group(1)) + 1  # add 1s buffer
+                            else:
+                                wait_time = 60  # default wait 60s if time not found
+                            print(f"Rate limited. Waiting {wait_time:.1f} seconds before retrying...")
+                            time.sleep(wait_time)
+                        else:
+                            # For other errors (invalid key, model not found, etc.)
+                            time.sleep(2)
+                        continue
+
                     response = data['choices'][0]['message']['content']
                     
                     if self._trim:
@@ -233,8 +263,12 @@ class LocalLLM(LLM):
                     all_samples.append(response)
                     break
 
-                except Exception:
-                    continue
+                except Exception as e:
+                    print(f"Attempt {attempt+1}/{max_retries} failed: {e}")
+                    time.sleep(2)
+            else:
+                print("Max retries reached. Skipping this sample.")
+                all_samples.append("")  # append empty so the loop doesn't hang
         
         return all_samples
     
@@ -264,4 +298,3 @@ class LocalLLM(LLM):
             response = response.json()["content"]
             
             return response if self._batch_inference else response[0]
-

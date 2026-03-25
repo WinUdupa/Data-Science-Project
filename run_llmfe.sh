@@ -1,5 +1,5 @@
 ################ LLM-FE with API ################
-export API_KEY=ENTER API KEY
+set API_KEY= ""
 #### Classification Datasets ####
 
 ## balance-scale ## 
